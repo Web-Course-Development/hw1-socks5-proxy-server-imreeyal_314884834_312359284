@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -17,6 +18,17 @@ const (
 	methodNoAuth       = 0x00 // "no authentication required"
 	methodUserPass     = 0x02 // "username/password" (RFC 1929)
 	methodNoAcceptable = 0xFF // server reply: none of the client's methods are acceptable
+
+	cmdConnect = 0x01 // the only command we support
+
+	atypIPv4   = 0x01 // DST.ADDR is 4 raw IPv4 bytes
+	atypDomain = 0x03 // DST.ADDR is a 1-byte length followed by the domain name
+
+	// CONNECT reply codes (REP), RFC 1928 §6.
+	repSuccess         = 0x00
+	repGeneralFailure  = 0x01 // used for any dial failure
+	repCommandNotSupp  = 0x07 // command not supported
+	repAddrTypeNotSupp = 0x08 // address type not supported
 )
 
 func main() {
@@ -59,11 +71,16 @@ func handleConnection(conn net.Conn) {
 		}
 	}
 
-	// TODO (next steps):
-	// 3. Read CONNECT request
-	// 4. Connect to target server
-	// 5. Send success/error reply
-	// 6. Relay data between client and target
+	// 3-5. Read the CONNECT request, dial the target, send the reply.
+	remote, err := handleConnect(conn)
+	if err != nil {
+		log.Printf("connect failed: %v", err)
+		return
+	}
+	defer remote.Close()
+
+	// 6. Relay data between client and target.
+	// TODO (next step): relay(conn, remote)
 }
 
 // negotiateAuth reads the client's SOCKS5 greeting and replies with the
@@ -153,4 +170,86 @@ func authenticateUserPass(conn net.Conn) error {
 	// Wrong credentials: reply with a non-zero status and fail.
 	conn.Write([]byte{authVersion, 0x01})
 	return fmt.Errorf("authentication failed for user %q", username)
+}
+
+// sendReply writes the 10-byte SOCKS5 CONNECT reply with the given REP code.
+// We always report ATYP=IPv4 with an all-zero bound address/port, which the
+// spec (§4.5) explicitly permits as a simplification.
+func sendReply(conn net.Conn, rep byte) error {
+	reply := []byte{
+		socks5Version, rep, 0x00, atypIPv4, // VER, REP, RSV, ATYP
+		0, 0, 0, 0, // BND.ADDR = 0.0.0.0
+		0, 0, // BND.PORT = 0
+	}
+	_, err := conn.Write(reply)
+	return err
+}
+
+// handleConnect reads a SOCKS5 CONNECT request, dials the requested target, and
+// sends the reply. On success it returns the open connection to the target so
+// the caller can relay data; on failure it sends an error reply and returns it.
+//
+// Request: VER | CMD | RSV | ATYP | DST.ADDR | DST.PORT
+func handleConnect(conn net.Conn) (net.Conn, error) {
+	// Read the 4-byte fixed header: VER, CMD, RSV, ATYP.
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return nil, fmt.Errorf("reading connect header: %w", err)
+	}
+	cmd, atyp := header[1], header[3]
+
+	// We only implement CONNECT.
+	if cmd != cmdConnect {
+		sendReply(conn, repCommandNotSupp)
+		return nil, fmt.Errorf("unsupported command %#x", cmd)
+	}
+
+	// Parse DST.ADDR according to the address type.
+	var host string
+	switch atyp {
+	case atypIPv4:
+		addr := make([]byte, 4)
+		if _, err := io.ReadFull(conn, addr); err != nil {
+			return nil, fmt.Errorf("reading IPv4 address: %w", err)
+		}
+		host = net.IP(addr).String()
+	case atypDomain:
+		lenByte := make([]byte, 1)
+		if _, err := io.ReadFull(conn, lenByte); err != nil {
+			return nil, fmt.Errorf("reading domain length: %w", err)
+		}
+		name := make([]byte, lenByte[0])
+		if _, err := io.ReadFull(conn, name); err != nil {
+			return nil, fmt.Errorf("reading domain name: %w", err)
+		}
+		host = string(name)
+	default:
+		sendReply(conn, repAddrTypeNotSupp)
+		return nil, fmt.Errorf("unsupported address type %#x", atyp)
+	}
+
+	// Read the 2-byte big-endian port.
+	portBytes := make([]byte, 2)
+	if _, err := io.ReadFull(conn, portBytes); err != nil {
+		return nil, fmt.Errorf("reading port: %w", err)
+	}
+	port := binary.BigEndian.Uint16(portBytes)
+
+	// Dial the target. net.Dial resolves domain names via DNS automatically.
+	target := fmt.Sprintf("%s:%d", host, port)
+	remote, err := net.Dial("tcp", target)
+	if err != nil {
+		// Any dial failure (refused, no route, DNS error, ...) -> general
+		// failure. The spec defines finer-grained codes, but distinguishing
+		// them needs platform-specific error inspection beyond this course.
+		sendReply(conn, repGeneralFailure)
+		return nil, fmt.Errorf("dialing %s: %w", target, err)
+	}
+
+	// Success: tell the client the connection is established.
+	if err := sendReply(conn, repSuccess); err != nil {
+		remote.Close()
+		return nil, fmt.Errorf("writing success reply: %w", err)
+	}
+	return remote, nil
 }
