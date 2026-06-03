@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"sync"
 )
 
 // SOCKS5 protocol constants (RFC 1928 / RFC 1929).
@@ -79,8 +80,8 @@ func handleConnection(conn net.Conn) {
 	}
 	defer remote.Close()
 
-	// 6. Relay data between client and target.
-	// TODO (next step): relay(conn, remote)
+	// 6. Relay data between client and target until both sides are done.
+	relay(conn, remote)
 }
 
 // negotiateAuth reads the client's SOCKS5 greeting and replies with the
@@ -173,8 +174,7 @@ func authenticateUserPass(conn net.Conn) error {
 }
 
 // sendReply writes the 10-byte SOCKS5 CONNECT reply with the given REP code.
-// We always report ATYP=IPv4 with an all-zero bound address/port, which the
-// spec (§4.5) explicitly permits as a simplification.
+// We always report ATYP=IPv4 with an all-zero bound address/port.
 func sendReply(conn net.Conn, rep byte) error {
 	reply := []byte{
 		socks5Version, rep, 0x00, atypIPv4, // VER, REP, RSV, ATYP
@@ -239,9 +239,7 @@ func handleConnect(conn net.Conn) (net.Conn, error) {
 	target := fmt.Sprintf("%s:%d", host, port)
 	remote, err := net.Dial("tcp", target)
 	if err != nil {
-		// Any dial failure (refused, no route, DNS error, ...) -> general
-		// failure. The spec defines finer-grained codes, but distinguishing
-		// them needs platform-specific error inspection beyond this course.
+		// Any dial failure
 		sendReply(conn, repGeneralFailure)
 		return nil, fmt.Errorf("dialing %s: %w", target, err)
 	}
@@ -252,4 +250,33 @@ func handleConnect(conn net.Conn) (net.Conn, error) {
 		return nil, fmt.Errorf("writing success reply: %w", err)
 	}
 	return remote, nil
+}
+
+// relay copies data in both directions between the client and the target until
+// both directions reach EOF. Each direction runs in its own goroutine; when a
+// direction finishes, we half-close the destination's write side so the peer
+// sees EOF (otherwise an HTTP response would never terminate).
+func relay(client, target net.Conn) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go copyAndCloseWrite(target, client, &wg) // client -> target (the request)
+	go copyAndCloseWrite(client, target, &wg) // target -> client (the response)
+
+	wg.Wait()
+}
+
+// copyAndCloseWrite copies everything from src to dst, then signals EOF to dst
+// by half-closing its write side. It marks the WaitGroup done when finished.
+func copyAndCloseWrite(dst, src net.Conn, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	io.Copy(dst, src)
+
+	// Send a TCP FIN on dst's write side only, leaving its read side open.
+	// CloseWrite is not part of the net.Conn interface, so we type-assert to
+	// the (TCP-satisfied) interface that declares it.
+	if cw, ok := dst.(interface{ CloseWrite() error }); ok {
+		cw.CloseWrite()
+	}
 }
