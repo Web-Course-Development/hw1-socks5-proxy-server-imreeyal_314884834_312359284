@@ -50,10 +50,16 @@ func handleConnection(conn net.Conn) {
 		log.Printf("auth negotiation failed: %v", err)
 		return
 	}
-	_ = method // (used in later steps once auth + CONNECT are implemented)
+
+	// 2. If we selected username/password, run the RFC 1929 sub-negotiation.
+	if method == methodUserPass {
+		if err := authenticateUserPass(conn); err != nil {
+			log.Printf("authentication failed: %v", err)
+			return
+		}
+	}
 
 	// TODO (next steps):
-	// 2. Perform authentication if required (when PROXY_USER env var is set)
 	// 3. Read CONNECT request
 	// 4. Connect to target server
 	// 5. Send success/error reply
@@ -103,4 +109,48 @@ func negotiateAuth(conn net.Conn) (byte, error) {
 	// No common method: tell the client 0xFF and give up on this connection.
 	conn.Write([]byte{socks5Version, methodNoAcceptable})
 	return methodNoAcceptable, fmt.Errorf("no acceptable auth method (wanted %#x)", want)
+}
+
+// authenticateUserPass performs the RFC 1929 username/password sub-negotiation.
+// It runs only after negotiateAuth selected methodUserPass (0x02).
+//
+// Request  (client -> server): VER | ULEN | UNAME | PLEN | PASSWD   (VER = 0x01)
+// Response (server -> client): VER | STATUS                          (0x00 = success)
+func authenticateUserPass(conn net.Conn) error {
+	// Read the 2-byte fixed header: VER (0x01) and ULEN (username length).
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return fmt.Errorf("reading auth header: %w", err)
+	}
+	if header[0] != authVersion {
+		return fmt.Errorf("unexpected auth version %#x (want 0x01)", header[0])
+	}
+
+	// Read exactly ULEN username bytes.
+	username := make([]byte, header[1])
+	if _, err := io.ReadFull(conn, username); err != nil {
+		return fmt.Errorf("reading username: %w", err)
+	}
+
+	// Read PLEN (password length), then exactly PLEN password bytes.
+	plen := make([]byte, 1)
+	if _, err := io.ReadFull(conn, plen); err != nil {
+		return fmt.Errorf("reading password length: %w", err)
+	}
+	password := make([]byte, plen[0])
+	if _, err := io.ReadFull(conn, password); err != nil {
+		return fmt.Errorf("reading password: %w", err)
+	}
+
+	// Compare against the configured credentials.
+	if string(username) == os.Getenv("PROXY_USER") && string(password) == os.Getenv("PROXY_PASS") {
+		if _, err := conn.Write([]byte{authVersion, 0x00}); err != nil {
+			return fmt.Errorf("writing auth success: %w", err)
+		}
+		return nil
+	}
+
+	// Wrong credentials: reply with a non-zero status and fail.
+	conn.Write([]byte{authVersion, 0x01})
+	return fmt.Errorf("authentication failed for user %q", username)
 }
